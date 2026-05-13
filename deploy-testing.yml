@@ -1,0 +1,136 @@
+name: Deploy to Testing Server
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout the code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 3. Install backend dependencies
+      - name: Install backend dependencies
+        working-directory: ./server
+        run: npm install
+
+      # 4. Run unit tests
+      - name: Run unit tests
+        working-directory: ./server
+        run: npm test
+
+      # 5. Run linting
+      - name: Run linting
+        working-directory: ./server
+        run: npm run lint
+
+      # 6. Install frontend dependencies
+      - name: Install frontend dependencies
+        working-directory: ./client
+        run: npm install
+
+      # 7. Build the frontend
+      - name: Build frontend
+        working-directory: ./client
+        run: npm run build
+        env:
+          VITE_API_BASE_URL: /api
+
+      # 8. Deploy to Testing-Server via SSH
+      - name: Deploy to Testing Server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.TESTING_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ~/Assignment4-1 || git clone https://github.com/Raneem28/Assignment4-1.git ~/Assignment4-1
+            cd ~/Assignment4-1
+            git fetch origin
+            git checkout ${{ github.head_ref || github.ref_name }}
+            git pull origin ${{ github.head_ref || github.ref_name }}
+
+            # Backend setup
+            cd server
+            npm install --production
+            pm2 restart todo-backend || pm2 start index.js --name todo-backend
+
+            # Frontend setup
+            cd ../client
+            npm install
+            echo "VITE_API_BASE_URL=/api" > .env
+            npm run build
+
+            # Fix permissions
+            sudo chmod -R 755 ~/Assignment4-1/client/dist
+            sudo systemctl reload nginx
+
+      # 9. Send success email
+      - name: Send success email
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: " Deployment to Testing SUCCESSFUL — PR #${{ github.event.pull_request.number }}"
+          to: ${{ secrets.INSTRUCTOR_EMAIL }}
+          from: GitHub Actions <${{ secrets.EMAIL_USERNAME }}>
+          body: |
+            Hello QA,
+
+            A new feature has been deployed to the Testing environment for your review.
+
+            Pull Request: #${{ github.event.pull_request.number }}
+            Developer: ${{ github.actor }}
+            Branch: ${{ github.head_ref || github.ref_name }}
+            Commit: ${{ github.event.head_commit.message }}
+
+            Access the deployed app at:
+            http://${{ secrets.TESTING_HOST }}
+
+            Please test the changes and approve the PR if everything works.
+
+            Thanks,
+            GitHub Actions Bot
+
+      # 10. Send failure email
+      - name: Send failure email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: " Deployment to Testing FAILED — PR #${{ github.event.pull_request.number }}"
+          to: ${{ secrets.INSTRUCTOR_EMAIL }},${{ github.event.pull_request.user.email }}
+          from: GitHub Actions <${{ secrets.EMAIL_USERNAME }}>
+          body: |
+            ️ Deployment to Testing environment FAILED.
+
+            Pull Request: #${{ github.event.pull_request.number }}
+            Developer: ${{ github.actor }}
+            Branch: ${{ github.head_ref || github.ref_name }}
+
+            🔗 View workflow logs:
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Please check the logs to see what went wrong.
+
+            Thanks,
+            GitHub Actions Bot

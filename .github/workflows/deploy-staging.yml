@@ -1,12 +1,12 @@
-name: Deploy to Staging Server
+name: Deploy to Testing Server (Docker)
 
 on:
-  push:
+  pull_request:
     branches: [main]
   workflow_dispatch:
 
 jobs:
-  build-test-deploy:
+  build-test-push-deploy:
     runs-on: ubuntu-latest
 
     steps:
@@ -40,31 +40,103 @@ jobs:
         env:
           VITE_API_BASE_URL: /api
 
-      - name: Deploy to Staging Server
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push backend image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: testing-${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/todo-backend:$IMAGE_TAG -t $ECR_REGISTRY/todo-backend:latest ./server
+          docker push $ECR_REGISTRY/todo-backend:$IMAGE_TAG
+          docker push $ECR_REGISTRY/todo-backend:latest
+
+      - name: Build and push frontend image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          IMAGE_TAG: testing-${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/todo-frontend:$IMAGE_TAG -t $ECR_REGISTRY/todo-frontend:latest ./client
+          docker push $ECR_REGISTRY/todo-frontend:$IMAGE_TAG
+          docker push $ECR_REGISTRY/todo-frontend:latest
+
+      - name: Deploy to Testing Server via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: ${{ secrets.STAGING_HOST }}
+          host: ${{ secrets.TESTING_HOST }}
           username: ${{ secrets.SSH_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
+            # Stop old containers if running
+            cd ~/Assignment4-1 2>/dev/null || git clone https://github.com/Raneem28/Assignment4-1.git ~/Assignment4-1
             cd ~/Assignment4-1
-            git checkout main
-            git pull origin main
+            git fetch origin
+            git checkout ${{ github.head_ref || github.ref_name }} 2>/dev/null || git checkout main
+            git pull origin ${{ github.head_ref || github.ref_name }} 2>/dev/null || git pull origin main
 
-            # Backend setup
-            cd server
-            npm install --production
-            pm2 restart todo-backend || pm2 start index.js --name todo-backend
+            # Login to ECR using EC2's IAM role
+            aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}
 
-            # Frontend setup
-            cd ../client
-            npm install
-            echo "VITE_API_BASE_URL=/api" > .env
-            npm run build
+            # Create docker-compose.prod.yml that pulls from ECR
+            cat > docker-compose.prod.yml << 'COMPOSE'
+            services:
+              mongodb:
+                image: mongo:7
+                container_name: todo-mongodb
+                restart: unless-stopped
+                volumes:
+                  - mongo-data:/data/db
+                networks:
+                  - todo-network
+              backend:
+                image: ${{ secrets.ECR_REGISTRY }}/todo-backend:latest
+                container_name: todo-backend
+                restart: unless-stopped
+                depends_on:
+                  - mongodb
+                environment:
+                  - PORT=5000
+                  - MONGODB_ATLAS_CONNECTION=mongodb://mongodb:27017/todoapp
+                  - NODE_ENV=production
+                networks:
+                  - todo-network
+              frontend:
+                image: ${{ secrets.ECR_REGISTRY }}/todo-frontend:latest
+                container_name: todo-frontend
+                restart: unless-stopped
+                depends_on:
+                  - backend
+                ports:
+                  - "80:80"
+                networks:
+                  - todo-network
+            networks:
+              todo-network:
+                driver: bridge
+            volumes:
+              mongo-data:
+                driver: local
+            COMPOSE
 
-            # Fix permissions
-            sudo chmod -R 755 ~/Assignment4-1/client/dist
-            sudo systemctl reload nginx
+            # Stop existing containers and pull fresh images
+            sudo docker compose -f docker-compose.prod.yml down 2>/dev/null || true
+            sudo docker compose -f docker-compose.prod.yml pull
+            sudo docker compose -f docker-compose.prod.yml up -d
+
+            # Clean up old images
+            sudo docker image prune -f
+
+            echo "✅ Deployment complete!"
+            sudo docker ps
 
       - name: Send success email
         if: success()
@@ -75,19 +147,24 @@ jobs:
           secure: true
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "✅ Deployment to STAGING successful"
+          subject: "✅ [Docker] Deployment to Testing SUCCESSFUL — PR #${{ github.event.pull_request.number }}"
           to: ${{ secrets.INSTRUCTOR_EMAIL }}
           from: GitHub Actions <${{ secrets.EMAIL_USERNAME }}>
           body: |
-            Hello,
+            Hello QA,
 
-            Changes have been deployed to the Staging environment.
+            A new containerized feature has been deployed to the Testing environment for your review.
 
-            👤 Pushed by: ${{ github.actor }}
-            💬 Commit: ${{ github.event.head_commit.message }}
+            📋 Pull Request: #${{ github.event.pull_request.number }}
+            👤 Developer: ${{ github.actor }}
+            🌿 Branch: ${{ github.head_ref || github.ref_name }}
+            🐳 Docker images pushed to ECR with tag: testing-${{ github.sha }}
 
             🌐 Access the deployed app at:
-            http://${{ secrets.STAGING_HOST }}
+            http://${{ secrets.TESTING_HOST }}
+
+            The application is now running in Docker containers (frontend + backend + MongoDB).
+            Please test the changes and approve the PR if everything works.
 
             Thanks,
             GitHub Actions Bot
@@ -101,16 +178,14 @@ jobs:
           secure: true
           username: ${{ secrets.EMAIL_USERNAME }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "❌ Deployment to STAGING FAILED"
+          subject: "❌ [Docker] Deployment to Testing FAILED — PR #${{ github.event.pull_request.number }}"
           to: ${{ secrets.INSTRUCTOR_EMAIL }}
           from: GitHub Actions <${{ secrets.EMAIL_USERNAME }}>
           body: |
-            ⚠️ Deployment to Staging failed.
+            ⚠️ Docker deployment to Testing FAILED.
 
-            👤 Pushed by: ${{ github.actor }}
+            📋 Pull Request: #${{ github.event.pull_request.number }}
+            👤 Developer: ${{ github.actor }}
 
-            🔗 View logs:
+            🔗 View workflow logs:
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
-
-            Thanks,
-            GitHub Actions Bot
