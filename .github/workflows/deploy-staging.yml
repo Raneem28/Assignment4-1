@@ -1,0 +1,116 @@
+name: Deploy to Staging Server
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install backend dependencies
+        working-directory: ./server
+        run: npm install
+
+      - name: Run unit tests
+        working-directory: ./server
+        run: npm test
+
+      - name: Run linting
+        working-directory: ./server
+        run: npm run lint
+
+      - name: Install frontend dependencies
+        working-directory: ./client
+        run: npm install
+
+      - name: Build frontend
+        working-directory: ./client
+        run: npm run build
+        env:
+          VITE_API_BASE_URL: /api
+
+      - name: Deploy to Staging Server
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.STAGING_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ~/Assignment4-1
+            git checkout main
+            git pull origin main
+
+            # Backend setup
+            cd server
+            npm install --production
+            pm2 restart todo-backend || pm2 start index.js --name todo-backend
+
+            # Frontend setup
+            cd ../client
+            npm install
+            echo "VITE_API_BASE_URL=/api" > .env
+            npm run build
+
+            # Fix permissions
+            sudo chmod -R 755 ~/Assignment4-1/client/dist
+            sudo systemctl reload nginx
+
+      - name: Send success email
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "✅ Deployment to STAGING successful"
+          to: ${{ secrets.INSTRUCTOR_EMAIL }}
+          from: GitHub Actions <${{ secrets.EMAIL_USERNAME }}>
+          body: |
+            Hello,
+
+            Changes have been deployed to the Staging environment.
+
+            👤 Pushed by: ${{ github.actor }}
+            💬 Commit: ${{ github.event.head_commit.message }}
+
+            🌐 Access the deployed app at:
+            http://${{ secrets.STAGING_HOST }}
+
+            Thanks,
+            GitHub Actions Bot
+
+      - name: Send failure email
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.EMAIL_USERNAME }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "❌ Deployment to STAGING FAILED"
+          to: ${{ secrets.INSTRUCTOR_EMAIL }}
+          from: GitHub Actions <${{ secrets.EMAIL_USERNAME }}>
+          body: |
+            ⚠️ Deployment to Staging failed.
+
+            👤 Pushed by: ${{ github.actor }}
+
+            🔗 View logs:
+            https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+            Thanks,
+            GitHub Actions Bot
